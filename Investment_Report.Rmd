@@ -1,0 +1,270 @@
+---
+title: "Investment Portfolio Report"
+author: "Justin Ferrara"
+date: "`r format(Sys.Date(), '%B %e, %Y')`"
+output:
+  prettydoc::html_pretty:
+    theme: cayman
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+library(tidyquant) # make sure library(recipes) is up to date
+library(dplyr)
+library(lubridate)
+library(kableExtra)
+library(zoo)
+library(reshape2)
+library(ggplot2)
+library(scales)
+
+```
+
+```{r time, include=FALSE}
+current_date = as.Date(Sys.Date())
+viz_start_date = as.Date(Sys.Date()) %m-% months(8)
+historical_start_date = as.Date(Sys.Date()) %m-% months(60)
+forecast_to_date = as.Date(Sys.Date()) %m+% months(12)
+
+```
+
+# Purpose
+
+The following report has a dual purpose of (1) providing the portfolio's owner a detailed account of investment performance in a format not always available to investors on trading platforms and (2) illustrating how the analyses and visualizations in the report can be created in an automated fashion using **RMarkdown** functionality.
+
+This report includes portfolio diagnostics such as the percentage breakdown of invested capital, portfolio returns over time, returns by ETF, price trends by ETF, and historical risk vs. return tradeoffs for each ETF in the portfolio.
+
+All of the contents of this report can be generated using one input: a log of investment `positions`.
+
+```{r positions}
+positions = as.data.frame(read.csv('Investment Positions.csv', stringsAsFactors=FALSE))
+positions = positions %>% mutate(Open.Date = mdy(Open.Date))
+
+```
+
+Once a log of positions is available, including ticker symbols, quantity of shares, purchase date, and cost per share at purchase date, then the script is ready to run.
+
+### Invested Capital
+
+```{r aggregate_positions}
+
+agg_positions = positions %>% 
+  group_by(Symbol) %>%
+  summarise(`Invested ($)` = round(sum(Cost), 0)) %>%
+  mutate(`Invested (%)` = round(((`Invested ($)`)/sum(`Invested ($)`))*100, 1))
+
+agg_positions %>%
+  arrange(desc(`Invested (%)`)) %>%
+  kbl() %>%
+  kable_classic_2(full_width = T)
+
+```
+
+We can pair the portfolio positions data input with historical price data using the `tidyquant` package.
+
+```{r historical_data, warning=FALSE}
+
+tickers = unique(positions$Symbol)
+
+prices = tq_get(tickers,
+                 from = historical_start_date,
+                 to = current_date,
+                 get = "stock.prices")
+
+```
+
+By pairing historical price data with current portfolio position data, we are able to generate insightful visualizations like the portfolio's performance over time.
+
+```{r daily_returns_function, warning=FALSE}
+
+portfolio_return_today = function(date){
+  
+  filter_positions = positions %>% filter(Open.Date <= date)
+  
+  if (date %in% prices$date) {
+      filter_date = date
+    } else if ((as.Date(date)-1) %in% prices$date) {
+      filter_date = as.Date(date)-1
+    } else if ((as.Date(date)-2) %in% prices$date) {
+      filter_date = as.Date(date)-2
+    } else {
+      filter_date = as.Date(date)-3
+    }
+  
+  filter_prices = prices %>% filter(date == filter_date)
+  
+  data = merge(filter_positions, 
+               filter_prices, 
+               by.x = c("Symbol"), 
+               by.y = c("symbol"))
+  
+  data$netChange = (data$close - data$Cost.per.share)*data$Quantity
+
+  daily_return = round(sum(data$netChange) / sum(data$Cost), 6)
+  
+  return(daily_return)
+  }
+
+```
+
+### Portfolio performance over time
+
+```{r daily_returns, warning=FALSE, fig.asp = 0.4, fig.width = 10, out.width = "100%"}
+
+dates = seq(as.Date(min(positions$Open.Date)), as.Date(current_date), by="days")
+days = c()
+daily_returns = c()
+
+for (i in dates){
+  days = append(days, as.Date(i))
+  daily_returns = append(daily_returns, portfolio_return_today(date = i)*100)
+}
+
+daily_return_df = data.frame(Days = days,
+                             Return = daily_returns)
+
+ggplot(daily_return_df, aes(x=Days, y=Return)) +
+  geom_ribbon(aes(ymin = 7.5, ymax = 12.5), fill = "grey", alpha = .2) +
+  geom_line() +
+  annotate("text", x = as.Date("2021-07-26"), y = 8.5, 
+           label = "Required Rate of Return", size = 4) + 
+  xlab("") + ylab("Portfolio Return (%)") +
+  theme_minimal()
+
+```
+
+Instead of looking at total value of portfolio over time, we look at portfolio return over time to avoid large fluctuations that would appear in the chart when a new trade is made.
+
+If we wanted to double-click on the analysis of returns, we can look at the holding period returns for each ETF owned in the portfolio. We can see that for this particular portfolio, seven of nine ETF investments in the portfolio are generating positive returns whereas two are negatively impacting the portfolio performance.
+
+```{r returns}
+
+last_trading_day = max(prices$date)
+
+current_prices = prices %>% filter(date == last_trading_day)
+
+calc_returns = merge(positions, current_prices, by.x = "Symbol", by.y = "symbol", all.x = TRUE)
+calc_returns$netChange = (calc_returns$close - calc_returns$Cost.per.share)*calc_returns$Quantity
+
+calc_returns_agg = calc_returns %>%
+  group_by(Symbol) %>%
+  summarise(totalNetChange = sum(netChange))
+
+returns = merge(agg_positions, calc_returns_agg, by = "Symbol", all.x = TRUE)
+returns$`Return (%)` = round((returns$totalNetChange/returns$`Invested ($)`)*100, 2)
+returns_view = returns[, c("Symbol", "Return (%)")]
+
+```
+
+### Holding period return by ETF investment
+
+```{r plot_returns, fig.asp = 0.6, fig.width = 10, out.width = "100%"}
+
+returns_view$color_code = ifelse(returns_view$`Return (%)` > 0, "green", "red")
+
+ggplot(returns_view, aes(x = reorder(Symbol, -`Return (%)`), y = `Return (%)`, fill = color_code)) + 
+  geom_bar(stat = "identity") +
+  scale_fill_manual(values=c("#138808", "#ed2939")) +
+  geom_text(aes(y = `Return (%)`, 
+                label = paste(format(round(`Return (%)`, 1)), "%", sep = ""), 
+                vjust = ifelse(`Return (%)` > 0, 2, -1)), 
+            size = 5, colour = "white") +
+  xlab("Investment") + ylab("Return (%)") +
+  theme_minimal() + theme(legend.position = "none")
+
+```
+
+### Moving Average Convergence Divergence (MACD) chart
+
+To give investors a better view of how each ETF is performing over time, we can observe potential trends that may influence buying or selling decisions. The MACD chart is commonly used by investors to track trends in price. A potential leading signal for buying or selling is when the moving average lines cross.
+
+```{r moving_averages, warning=FALSE, fig.asp = 0.8, fig.width = 10, out.width = "100%"}
+
+moving_average_prices = prices %>%
+  arrange(date) %>%
+  group_by(symbol) %>%
+  mutate(price_28da = zoo::rollmean(close, k = 28, fill = NA),
+         price_14da= zoo::rollmean(close, k = 14, fill = NA)) %>%
+  select(symbol, date, close, price_28da, price_14da)
+
+moving_avg_pivot = melt(moving_average_prices, id = c("symbol", "date"))
+
+moving_avg_pivot %>%
+  filter(date >= as.Date(viz_start_date)) %>%
+  ggplot(aes(x=date, y=value, group=variable)) +
+  scale_color_manual(values=c("#C5C5C5", "#0000DC", "#C46C00")) +
+  facet_wrap(~symbol, scales = "free") +
+  geom_line(aes(color=variable)) +
+  xlab("") + ylab("Closing Price ($)") +
+  theme_minimal()
+
+```
+
+The MACD chart is useful to investors looking to make decisions about individual investments, but these decisions must not be made in isolation. A smart investor must also consider the dyanimics at play with the entire portfolio. What is the concentration of capital spread across the portfolio?
+
+### Investment concentration
+
+```{r investment_diversity1, fig.asp = 0.4, fig.width = 10, out.width = "100%"}
+
+agg_positions %>%
+  arrange(desc(`Invested (%)`)) %>%
+  mutate(`Cumulative Investment (%)` = cumsum(`Invested (%)`),
+         Counter = 1:length(Symbol)) %>%
+  ggplot(aes(x=Counter, y=`Cumulative Investment (%)`)) +
+  geom_line(color = "black") +
+  geom_point() +
+  ylim(c(0, 100)) +
+  scale_x_continuous(breaks = pretty_breaks()) +
+  xlab("Investments in Portfolio (#)") +
+  theme_minimal()
+
+```
+
+What is the expected return of our investments against what risk we would expect from the investments historically?
+
+```{r risk, warning=FALSE, message=FALSE}
+
+prices$year = substr(prices$date, 1, 4)
+prices$month = substr(prices$date, 6, 7)
+
+agg_return_dates = prices %>%
+  group_by(year, month) %>%
+  summarise(`Beginning Date` = min(date),
+            `End Date` = max(date))
+
+agg_return_dates = agg_return_dates[c(-1, -length(agg_return_dates$`End Date`)),]
+
+prep_prices = prices[,c("symbol", "date", "close")]
+prep_prices = dcast(prep_prices,date~symbol)
+
+agg_return = merge(agg_return_dates, prep_prices, by.x = "Beginning Date", by.y = "date", all.x = TRUE)
+drop_cols = c("year", "month")
+agg_return = agg_return[,!(names(agg_return) %in% drop_cols)]
+agg_return = melt(agg_return, id = c("Beginning Date", "End Date"))
+
+agg_return = merge(agg_return, prices, by.x = c("End Date", "variable"), by.y = c("date", "symbol"), all.x = TRUE)
+agg_return$monthly_return = round((agg_return$close - agg_return$value)/agg_return$value, 4)
+
+agg_risk_return = agg_return %>%
+  group_by(variable) %>%
+  summarise(`Historical Monthly Return (%)` = round(mean(monthly_return, na.rm = TRUE), 4),
+            `Historical Risk (%)` = round(sd(monthly_return, na.rm = TRUE), 4)) %>%
+  left_join(agg_positions, by = c("variable" = "Symbol"))
+
+```
+
+### Portfolio risk vs. return tradeoffs
+
+```{r risk_viz, warning=FALSE, message=FALSE, fig.asp = 0.6, fig.width = 10, out.width = "100%"}
+
+ggplot(agg_risk_return, aes(x = `Historical Monthly Return (%)`, y = `Historical Risk (%)`)) +
+  geom_vline(xintercept=0.006, linetype="dashed", # estimate of monthly average return of DJIA since 1920
+                color = "black", size=0.5) +
+  geom_point(aes(size = `Invested ($)`), color = "black") +
+  geom_label(aes(label=variable), 
+    check_overlap = T, size = 3) +
+  scale_size(range = c(1, 50)) +
+  annotate("text", x = .009, y = .105, label = "DJIA Historical \nMonthly Return", size = 3) +
+  theme_minimal() + theme(legend.position = "none")
+
+```
